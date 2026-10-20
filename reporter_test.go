@@ -3,6 +3,7 @@ package qingniao
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -280,5 +281,94 @@ func TestCloseIsIdempotentAndStatsHonest(t *testing.T) {
 	}
 	if cs.count() != 1 {
 		t.Fatalf("delivery mismatch: %d", cs.count())
+	}
+}
+
+// ---- 关闭竞态、兜底计数、默认 sink（2026-10-20 补） ----------------------
+
+// fallbackSink 模拟"投递失败但已落盘"的 sink。
+type fallbackSink struct{}
+
+func (fallbackSink) Send(Envelope) error {
+	return fmt.Errorf("%w: injected", ErrFallbackWritten)
+}
+
+func TestStatsCountFallbackSeparatelyFromDelivered(t *testing.T) {
+	r := New(Option{
+		Sink:     fallbackSink{},
+		Meta:     Meta{Repo: "example.com/test"},
+		Throttle: 0,
+	})
+	r.Error("boom", errors.New("boom"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r.Close(ctx)
+	stats := r.Stats()
+	if stats.Reported != 0 {
+		t.Fatalf("fallback must not count as reported: %+v", stats)
+	}
+	if stats.Fallback != 1 {
+		t.Fatalf("fallback count = %d, want 1: %+v", stats.Fallback, stats)
+	}
+}
+
+// Close 与并发 submit 曾经让 SDK 自己 panic（send on closed channel）。
+func TestConcurrentSubmitDuringCloseDoesNotPanic(t *testing.T) {
+	r, _ := newTestReporter(t, nil, nil)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					r.Error("concurrent", errors.New("concurrent"))
+				}
+			}
+		}()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	r.Close(ctx)
+	cancel()
+	close(stop)
+	wg.Wait()
+	// 关闭后再调用也不能 panic。
+	r.Error("after close", errors.New("after close"))
+	r.Close(context.Background())
+}
+
+func TestDefaultSinkIsFileSinkWhenEndpointIsMissing(t *testing.T) {
+	t.Setenv("NUWA_INGEST_URL", "")
+	sink := defaultSink()
+	if _, ok := sink.(FileSink); !ok {
+		t.Fatalf("missing endpoint must fall back to the file sink, got %T", sink)
+	}
+
+	t.Setenv("NUWA_INGEST_URL", "http://127.0.0.1:1/ingest")
+	sink = defaultSink()
+	httpSink, ok := sink.(HTTPSink)
+	if !ok {
+		t.Fatalf("configured endpoint must use the HTTP sink, got %T", sink)
+	}
+	if httpSink.FallbackFile == "" {
+		t.Fatal("http sink must persist to a fallback file so a failed delivery is not lost")
+	}
+}
+
+func TestCheckStopIsIdempotent(t *testing.T) {
+	r, cs := newTestReporter(t, nil, nil)
+	stop := r.Check("probe", 10*time.Millisecond, func() error { return errors.New("down") })
+	time.Sleep(30 * time.Millisecond)
+	stop()
+	stop() // 重复调用不得 panic。
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r.Close(ctx)
+	if cs.count() == 0 {
+		t.Fatal("check should have reported the failure")
 	}
 }

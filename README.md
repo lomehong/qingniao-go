@@ -42,3 +42,14 @@ if fatal { q.Fatal("config corrupt", err) }
 
 语义化版本。v0.1 函数式 API（`Capture`/`Report`/Sinks）保留兼容。
 当前：[![v0.2.0](https://img.shields.io/badge/module-v0.2.0-blue)](https://pkg.go.dev/github.com/lomehong/qingniao-go)
+
+### v0.2.1 补丁（未发布）
+
+- 零配置 sink 自带兜底：端点缺失 → 直接落盘；端点存在但投递失败 → 落盘
+  `<缓存目录>/qingniao/fallback.jsonl`（此前失败只计数不落盘，信号会丢）。
+- 投递失败但已落盘时 `Send` 返回 `ErrFallbackWritten`（用 `errors.Is` 判断）：
+  信号没丢，但没送达；`Stats()` 的 `Reported` / `Fallback` / `Dropped` 语义互斥。
+- 关闭与并发上报不再 panic（投递队列不再被 close）。
+- 自检停止函数可重复调用；`Fatal` 的 flush 最多等 2s。
+- panic 信号带**客户端指纹**（与服务端 Go 栈算法逐字一致，两侧 golden 互钉；
+  服务端当前自算，字段被忽略）。

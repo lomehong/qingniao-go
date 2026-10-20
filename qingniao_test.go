@@ -198,8 +198,9 @@ func TestHTTPSinkFallsBackToFile(t *testing.T) {
 		MaxAttempts:  2,
 		FallbackFile: path,
 	}
-	if err := sink.Send(PanicEnvelope(testMeta, "fallback me", nil, time.Now())); err != nil {
-		t.Fatalf("fallback should preserve the signal: %v", err)
+	// 兜底成功 = 信号没丢，但**没送达**：用哨兵错误区分（v0.2.1 契约）。
+	if err := sink.Send(PanicEnvelope(testMeta, "fallback me", nil, time.Now())); !errors.Is(err, ErrFallbackWritten) {
+		t.Fatalf("fallback must report ErrFallbackWritten: %v", err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -231,3 +232,71 @@ func TestHTTPSinkTimeoutIsBounded(t *testing.T) {
 type collectFunc func(Envelope) error
 
 func (f collectFunc) Send(e Envelope) error { return f(e) }
+
+// ---- 兜底与指纹（2026-10-20 补） ----------------------------------------
+
+func TestHTTPSinkFallbackIsSignalledNotSilentlyDelivered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "nested", "fallback.jsonl")
+	sink := HTTPSink{Endpoint: srv.URL, Timeout: 200 * time.Millisecond, MaxAttempts: 2, FallbackFile: path}
+	err := sink.Send(Envelope{Schema: Schema, Repo: "example.com/test", Title: "boom"})
+	if !errors.Is(err, ErrFallbackWritten) {
+		t.Fatalf("want ErrFallbackWritten, got %v", err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read fallback: %v", readErr)
+	}
+	if !strings.Contains(string(data), "boom") {
+		t.Fatalf("fallback file missing envelope: %s", data)
+	}
+}
+
+func TestFileSinkCreatesMissingParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a", "b", "fallback.jsonl")
+	if err := (FileSink{Path: path}).Send(Envelope{Schema: Schema, Title: "boom"}); err != nil {
+		t.Fatalf("file sink: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("fallback file not created: %v", err)
+	}
+}
+
+// 客户端 panic 指纹必须与山海经服务端算法一致，否则同一次崩溃会因
+// "谁算的"落进两个聚合 key。golden 值与 crates/shanhaijing 的测试互钉。
+func TestPanicEnvelopeFingerprintMatchesTheServerGolden(t *testing.T) {
+	stack := []byte("panic: runtime error: index out of range [3] with length 3\n\n" +
+		"goroutine 1 [running]:\n" +
+		"example.com/spike-target.Average(...)\n" +
+		"\t/app/calc.go:17 +0x8c\n" +
+		"example.com/spike-target.main()\n" +
+		"\t/app/calc.go:25 +0x58\n" +
+		"created by testing.(*T).Run in goroutine 1\n" +
+		"\tC:/Program Files/Go/src/testing/testing.go:1851 +0x3f6")
+	env := PanicEnvelope(Meta{Repo: "example.com/spike-target"}, "runtime error: index out of range [3] with length 3", stack, time.Now())
+	const golden = "20d8a3f3347cf11e192a405cd3434789"
+	if env.Fingerprint != golden {
+		t.Fatalf("panic fingerprint = %s, want %s", env.Fingerprint, golden)
+	}
+}
+
+func TestPanicFingerprintIsStableAcrossAddressAndLineDrift(t *testing.T) {
+	base := "panic: runtime error: index out of range [3] with length 3\n\n" +
+		"goroutine 1 [running]:\n" +
+		"example.com/spike-target.Average(...)\n" +
+		"\t/app/calc.go:17 +0x8c\n" +
+		"example.com/spike-target.main()\n" +
+		"\t/app/calc.go:25 +0x58"
+	drifted := strings.ReplaceAll(base, "[3] with length 3", "[9] with length 9")
+	drifted = strings.ReplaceAll(drifted, "calc.go:17", "calc.go:21")
+	drifted = strings.ReplaceAll(drifted, "+0x8c", "+0x91")
+	a := panicFingerprint("runtime error: index out of range [3] with length 3", base)
+	b := panicFingerprint("runtime error: index out of range [9] with length 9", drifted)
+	if a != b {
+		t.Fatalf("volatile parts must not change the fingerprint: %s vs %s", a, b)
+	}
+}

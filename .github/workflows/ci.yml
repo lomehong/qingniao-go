@@ -1,0 +1,35 @@
+# 质量门禁：gofmt + vet + test 全绿。与 SPEC.md 的行为规范一起构成
+# 青鸟的发布前提——采集 SDK 的失败会被下游放大（崩溃路径依赖它），
+# 门禁从严。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt（有输出即失败）
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: go test（-race 检测数据竞争——Reporter 的队列/节流全并发）
+        run: |
+          set +e
+          go test -race ./... > go-test.log 2>&1
+          status=$?
+          cat go-test.log
+          exit $status
+      - name: 上传测试日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-test-log
+          path: go-test.log
+          retention-days: 14

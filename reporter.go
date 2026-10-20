@@ -4,11 +4,13 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,10 @@ type Reporter struct {
 	redact   func(string) string
 	throttle time.Duration
 	queue    chan Envelope
+	// done 关闭时投递循环排空队列并退出。**队列本身永不 close**——并发
+	// submit 与 Close 竞争时 close(channel) 会 panic（send on closed
+	// channel），违反 SPEC §6.3「SDK 自身永不 panic」。
+	done     chan struct{}
 	exitFunc func(int)
 
 	mu       sync.Mutex
@@ -56,14 +62,7 @@ type Option struct {
 // New 构建五挂点采集器并启动异步投递与自检调度。用 Close 停止。
 func New(opt Option) *Reporter {
 	if opt.Sink == nil {
-		url := os.Getenv("NUWA_INGEST_URL")
-		if url == "" {
-			// 无端点：落盘兜底，信号永不静默丢失。
-			dir, _ := os.UserCacheDir()
-			opt.Sink = FileSink{Path: filepath.Join(dir, "qingniao", "fallback.jsonl")}
-		} else {
-			opt.Sink = HTTPSink{Endpoint: url, Token: os.Getenv("NUWA_INGEST_TOKEN")}
-		}
+		opt.Sink = defaultSink()
 	}
 	if opt.Redact == nil {
 		opt.Redact = func(s string) string { return s }
@@ -91,6 +90,7 @@ func New(opt Option) *Reporter {
 		redact:    opt.Redact,
 		throttle:  opt.Throttle,
 		queue:     make(chan Envelope, opt.QueueSize),
+		done:      make(chan struct{}),
 		exitFunc:  opt.ExitFunc,
 		lastSent:  map[string]time.Time{},
 		checkStop: make(chan struct{}),
@@ -102,21 +102,65 @@ func New(opt Option) *Reporter {
 
 // NewFromEnv 用 NUWA_INGEST_URL / NUWA_INGEST_TOKEN 推导 Sink。
 func NewFromEnv(meta Meta) *Reporter {
-	return New(Option{Meta: meta, Sink: HTTPSink{
-		Endpoint: os.Getenv("NUWA_INGEST_URL"),
-		Token:    os.Getenv("NUWA_INGEST_TOKEN"),
-	}})
+	return New(Option{Meta: meta})
+}
+
+// defaultSink 是零配置 sink：端点缺失时直接落盘；端点存在时 HTTP 投递，
+// 失败后落盘兜底（SPEC §6.2：信封不丢）。
+func defaultSink() Sink {
+	fallback := defaultFallbackPath()
+	url := strings.TrimSpace(os.Getenv("NUWA_INGEST_URL"))
+	if url == "" {
+		return FileSink{Path: fallback}
+	}
+	return HTTPSink{
+		Endpoint:     url,
+		Token:        os.Getenv("NUWA_INGEST_TOKEN"),
+		FallbackFile: fallback,
+	}
+}
+
+// defaultFallbackPath 是默认兜底文件位置（用户缓存目录下的 qingniao/）。
+func defaultFallbackPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "qingniao", "fallback.jsonl")
 }
 
 // deliverLoop 消费异步队列：信封逐条投递（超时/重试/落盘兜底由 Sink 承担）。
+// Close 时把手上的队列排空再退出（SPEC §2 的 flush）。
 func (r *Reporter) deliverLoop() {
 	defer r.wg.Done()
-	for env := range r.queue {
-		if err := r.sink.Send(env); err != nil {
-			r.fallback.Add(1)
-		} else {
-			r.reported.Add(1)
+	for {
+		select {
+		case env := <-r.queue:
+			r.deliver(env)
+		case <-r.done:
+			for {
+				select {
+				case env := <-r.queue:
+					r.deliver(env)
+				default:
+					return
+				}
+			}
 		}
+	}
+}
+
+// deliver 投递一条并记账：送达 ingest=reported，落盘兜底=fallback，
+// 既没送达也没落盘=dropped（信号丢了）。
+func (r *Reporter) deliver(env Envelope) {
+	err := r.sink.Send(env)
+	switch {
+	case err == nil:
+		r.reported.Add(1)
+	case errors.Is(err, ErrFallbackWritten):
+		r.fallback.Add(1)
+	default:
+		r.dropped.Add(1)
 	}
 }
 
@@ -148,6 +192,11 @@ func (r *Reporter) submit(env Envelope) {
 			r.dropped.Add(1)
 		default:
 		}
+		if r.closed.Load() {
+			// Close 与 submit 并发：队列不会再被消费，别悄悄塞进去。
+			r.dropped.Add(1)
+			return
+		}
 		select {
 		case r.queue <- env:
 		default:
@@ -158,11 +207,7 @@ func (r *Reporter) submit(env Envelope) {
 
 // sendSync 是同步入口（panic / Fatal 路径）：进程将死，阻塞式投递。
 func (r *Reporter) sendSync(env Envelope) {
-	if err := r.sink.Send(env); err != nil {
-		r.fallback.Add(1)
-	} else {
-		r.reported.Add(1)
-	}
+	r.deliver(env)
 }
 
 // Capture 包装执行入口：panic 被捕获、同步上报后原样重抛——采集不改变
@@ -220,13 +265,16 @@ func (r *Reporter) ErrorSeverity(title string, err error, severity string) {
 }
 
 // Fatal 同步上报 → flush → exit(1)。用于"上报后必须退出"的接入方语义。
+// flush 有 2s 上限：退出路径不能被一个卡住的 Sink 拖住。
 func (r *Reporter) Fatal(title string, err error) {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
 	r.sendSync(r.envelope(title, msg, "high", Stack()))
-	r.Close(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r.Close(ctx)
 	r.exitFunc(1)
 }
 
@@ -244,6 +292,7 @@ func (r *Reporter) CheckSeverity(name string, interval time.Duration, severity s
 	}
 	ticker := time.NewTicker(interval)
 	stop := make(chan struct{})
+	var once sync.Once
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
@@ -261,7 +310,8 @@ func (r *Reporter) CheckSeverity(name string, interval time.Duration, severity s
 			}
 		}
 	}()
-	return func() { close(stop) }
+	// 停止函数幂等：重复调用不 panic（SPEC §6.3）。
+	return func() { once.Do(func() { close(stop) }) }
 }
 
 // Close 停止自检与后台投递，并等待队列排空（受 ctx 约束）。幂等。
@@ -270,7 +320,8 @@ func (r *Reporter) Close(ctx context.Context) {
 		return
 	}
 	close(r.checkStop)
-	close(r.queue)
+	// 只关 done，不关 queue：并发 submit 往已关闭的 channel 发送会 panic。
+	close(r.done)
 	done := make(chan struct{})
 	go func() { r.wg.Wait(); close(done) }()
 	select {

@@ -1,0 +1,29 @@
+# 发布流水线：push v* tag 触发。qingniao-go 是库——Go module proxy
+# 从 git tag 自动拾取版本，无二进制需要构建；本 workflow 的职责是
+# 在打 tag 时把测试再跑一遍（防"tag 上的代码没过门禁"）并创建
+# GitHub Release（自动生成 notes）。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt（有输出即失败）
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"

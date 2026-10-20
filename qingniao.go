@@ -13,9 +13,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -61,6 +63,10 @@ type Sink interface {
 	Send(e Envelope) error
 }
 
+// ErrFallbackWritten 表示投递失败、但信封已写入本地 FallbackFile：信号没丢，
+// 但没有送达服务端。Reporter 用它把"已送达"与"已兜底"分开计数。
+var ErrFallbackWritten = errors.New("signal written to fallback file")
+
 // PanicEnvelope builds an envelope from a recovered panic value and a stack
 // dump (runtime/debug.Stack shape — the goroutine trace format). Exported so
 // hosts can pre-capture and ship later.
@@ -79,17 +85,22 @@ func PanicEnvelope(meta Meta, recovered any, stack []byte, now time.Time) Envelo
 		sev = "high"
 	}
 	host, _ := os.Hostname()
+	headline := firstLine(msg)
 	return Envelope{
 		Schema:     Schema,
 		Repo:       meta.Repo,
 		Language:   "go",
 		Service:    meta.Service,
 		Host:       host,
-		Title:      "panic: " + firstLine(msg),
+		Title:      "panic: " + headline,
 		Severity:   sev,
-		Message:    firstLine(msg),
+		Message:    headline,
 		StackTrace: string(stack),
 		TsUnixMs:   now.UnixMilli(),
+		// 客户端指纹与服务端算法一致（SPEC §4）。服务端当前按自己的算法
+		// 计算（信封超集原则，字段被忽略），两份值一致便于对账，也保证
+		// 服务端将来"优先采用客户端指纹"时无缝切换。
+		Fingerprint: panicFingerprint(headline, string(stack)),
 	}
 }
 
@@ -162,12 +173,24 @@ func (f FileSink) Send(e Envelope) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureParentDir(f.Path); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(f.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	return appendAll(file, append(line, '\n'))
+}
+
+// ensureParentDir 建好落盘目录——否则"兜底"会因目录不存在而静默失败。
+func ensureParentDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o700)
 }
 
 func appendAll(file *os.File, data []byte) error {
@@ -256,7 +279,8 @@ func (h HTTPSink) Send(e Envelope) error {
 
 	if h.FallbackFile != "" {
 		if err := appendJSONL(h.FallbackFile, body); err == nil {
-			return nil
+			// 信号已落盘，但没有送达：用哨兵错误让调用方分开计数。
+			return fmt.Errorf("%w: %v", ErrFallbackWritten, lastErr)
 		} else {
 			return fmt.Errorf("%w; fallback write failed: %v", lastErr, err)
 		}
@@ -265,6 +289,9 @@ func (h HTTPSink) Send(e Envelope) error {
 }
 
 func appendJSONL(path string, body []byte) error {
+	if err := ensureParentDir(path); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
