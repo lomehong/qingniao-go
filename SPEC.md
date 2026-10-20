@@ -75,13 +75,21 @@
 | `Fallback` | 投递失败但已写入本地兜底文件（信号在，人没看到） |
 | `Dropped` | 信号既没送达也没落盘：节流抑制 / 队列满丢弃 / 投递失败且无兜底文件 |
 
-## 7 · 安全
+## 7 · 安全与配置
+
+- **服务端地址与凭证**：三级配置——显式 `Option.Sink` > 环境变量 > 本地
+  FallbackFile 兜底。环境变量用 SDK 自己的命名空间（通用性——接入方不
+  必须是 Nuwa），并兼容 Nuwa 旧键：
+
+  | 语义 | 首选 | 兼容回退 |
+  |------|------|---------|
+  | 服务端地址 | `QINGNIAO_ENDPOINT` | `NUWA_INGEST_URL` |
+  | 凭证 | `QINGNIAO_TOKEN` | `NUWA_INGEST_TOKEN` |
 
 - `Redact` 钩子（`func(string) string`，默认恒等）应用于信封的
   title / message / attributes / stack——错误消息与日志天然携带敏感
   数据，源头脱敏是 SDK 的责任，服务端脱敏只是最后一道。
-- 凭证只走 env（`NUWA_INGEST_URL` / `NUWA_INGEST_TOKEN`）或显式
-  Option，不落盘、不进日志。
+- 凭证只走 env 或显式 Option，不落盘、不进日志。
 
 ## 8 · 信封（qingniao/v1 超集原则）
 

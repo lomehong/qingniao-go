@@ -13,7 +13,7 @@ import "github.com/lomehong/qingniao-go"
 
 q := qingniao.New(qingniao.Option{
     Meta: qingniao.Meta{Repo: "github.com/you/your-repo", Service: "api"},
-    // Sink 缺省从 NUWA_INGEST_URL / NUWA_INGEST_TOKEN 推导
+    // Sink 缺省从 QINGNIAO_ENDPOINT / QINGNIAO_TOKEN 推导（兼容 NUWA_* 旧键）
     // Redact: func(s string) string { ... }   // 源头脱敏（可选）
 })
 defer q.Close(context.Background())

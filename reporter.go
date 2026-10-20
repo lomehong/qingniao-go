@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,17 +106,38 @@ func NewFromEnv(meta Meta) *Reporter {
 
 // defaultSink 是零配置 sink：端点缺失时直接落盘；端点存在时 HTTP 投递，
 // 失败后落盘兜底（SPEC §6.2：信封不丢）。
+//
+// 环境变量读取顺序（通用命名空间优先，Nuwa 旧键兼容回退，SPEC §7）：
+//
+//	QINGNIAO_ENDPOINT → NUWA_INGEST_URL
+//	QINGNIAO_TOKEN    → NUWA_INGEST_TOKEN
 func defaultSink() Sink {
 	fallback := defaultFallbackPath()
-	url := strings.TrimSpace(os.Getenv("NUWA_INGEST_URL"))
+	url := firstNonEmpty(
+		os.Getenv("QINGNIAO_ENDPOINT"),
+		os.Getenv("NUWA_INGEST_URL"),
+	)
 	if url == "" {
 		return FileSink{Path: fallback}
 	}
+	token := firstNonEmpty(
+		os.Getenv("QINGNIAO_TOKEN"),
+		os.Getenv("NUWA_INGEST_TOKEN"),
+	)
 	return HTTPSink{
 		Endpoint:     url,
-		Token:        os.Getenv("NUWA_INGEST_TOKEN"),
+		Token:        token,
 		FallbackFile: fallback,
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // defaultFallbackPath 是默认兜底文件位置（用户缓存目录下的 qingniao/）。

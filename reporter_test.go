@@ -343,6 +343,7 @@ func TestConcurrentSubmitDuringCloseDoesNotPanic(t *testing.T) {
 
 func TestDefaultSinkIsFileSinkWhenEndpointIsMissing(t *testing.T) {
 	t.Setenv("NUWA_INGEST_URL", "")
+	t.Setenv("QINGNIAO_ENDPOINT", "")
 	sink := defaultSink()
 	if _, ok := sink.(FileSink); !ok {
 		t.Fatalf("missing endpoint must fall back to the file sink, got %T", sink)
@@ -356,6 +357,32 @@ func TestDefaultSinkIsFileSinkWhenEndpointIsMissing(t *testing.T) {
 	}
 	if httpSink.FallbackFile == "" {
 		t.Fatal("http sink must persist to a fallback file so a failed delivery is not lost")
+	}
+}
+
+// SPEC §7：通用命名空间优先，Nuwa 旧键兼容回退。
+func TestDefaultSinkPrefersQingniaoNamespaceOverLegacyKeys(t *testing.T) {
+	t.Setenv("QINGNIAO_ENDPOINT", "http://new:1/ingest")
+	t.Setenv("QINGNIAO_TOKEN", "new-token")
+	t.Setenv("NUWA_INGEST_URL", "http://legacy:2/ingest")
+	t.Setenv("NUWA_INGEST_TOKEN", "legacy-token")
+
+	sink, ok := defaultSink().(HTTPSink)
+	if !ok {
+		t.Fatalf("expected HTTP sink, got %T", sink)
+	}
+	if sink.Endpoint != "http://new:1/ingest" || sink.Token != "new-token" {
+		t.Fatalf("QINGNIAO_* must take precedence: %+v", sink)
+	}
+
+	t.Setenv("QINGNIAO_ENDPOINT", "")
+	t.Setenv("QINGNIAO_TOKEN", "")
+	sink, ok = defaultSink().(HTTPSink)
+	if !ok {
+		t.Fatalf("expected HTTP sink, got %T", sink)
+	}
+	if sink.Endpoint != "http://legacy:2/ingest" || sink.Token != "legacy-token" {
+		t.Fatalf("NUWA_* legacy keys must still work as fallback: %+v", sink)
 	}
 }
 
