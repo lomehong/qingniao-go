@@ -30,6 +30,9 @@ type Meta struct {
 	Repo     string // e.g. "example.com/spike-target"
 	Service  string // optional deployment/service name
 	Severity string // default "high" for panics, "medium" for Report
+	// Instance 标识多副本中的具体进程；空则 Reporter 自动补
+	// host:pid:boot 随机串（SPEC §8）。
+	Instance string
 }
 
 // Envelope is the unified, language-agnostic event envelope.
@@ -44,6 +47,13 @@ type Envelope struct {
 	Message    string `json:"message,omitempty"`
 	StackTrace string `json:"stack_trace"`
 	TsUnixMs   int64  `json:"ts_unix_ms"`
+	// Fingerprint 是客户端侧归一化指纹（SPEC §4）。optional：服务端可
+	// 优先采用，否则按 stack_trace 自行计算——新旧服务端都不破坏。
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// Instance 标识多副本部署中的具体进程（host:pid:boot 随机串）。
+	Instance string `json:"instance,omitempty"`
+	// Attributes 承载日志 attrs 等结构化上下文。
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 // Sink receives envelopes. Implementations must be safe for concurrent use.

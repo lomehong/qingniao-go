@@ -1,25 +1,44 @@
 # qingniao-go（青鸟 · Go 采集 SDK）
 
-Nuwa 自愈流水线的 Go 采集 SDK：捕获 panic / 错误信号 → 指纹化（归一化栈）→ JSONL 落盘或 HTTP 上报。
+Nuwa 自愈流水线的 Go 采集 SDK。行为规范见 [SPEC.md](SPEC.md)（语言无关，各语言实现共用）。
 
-## 用法
+**五类信号，双通道投递**：panic（同步）、goroutine panic（同步）、显式错误（异步队列）、
+错误日志（slog Handler，异步）、失败自检（异步）。指纹模板归一化 + 客户端节流 +
+超时/重试/落盘兜底——崩溃路径永不挂死，高频错误永不阻塞主流程。
+
+## 用法（v0.2）
 
 ```go
 import "github.com/lomehong/qingniao-go"
 
-// 崩溃捕获：记录信号后按原 panic 继续抛出（不吞 panic）
-defer qingniao.Capture(qingniao.Config{
-    Repo:      "github.com/you/your-repo",
-    Language:  "go",
-    Sink:      qingniao.HTTPSink{Endpoint: "http://nuwa-host:7321/api/v1/ingest"},
-    Fingerprint: qingniao.FingerprintConfig{...},
+q := qingniao.New(qingniao.Option{
+    Meta: qingniao.Meta{Repo: "github.com/you/your-repo", Service: "api"},
+    // Sink 缺省从 NUWA_INGEST_URL / NUWA_INGEST_TOKEN 推导
+    // Redact: func(s string) string { ... }   // 源头脱敏（可选）
 })
-```
+defer q.Close(context.Background())
 
-- `HTTPSink`：每次上报带超时（默认 3s）与有界重试（默认 2 次），最终失败可落 `FallbackFile`（JSONL），崩溃路径永不挂死
-- `FileSink`：直接写 JSONL
-- 指纹：归一化栈符号（去地址/行号漂移），同因聚合
+// 1. panic：捕获 → 同步上报 → 原样重抛（不改变失败语义）
+defer q.Capture(func() { run() })
+
+// 2. goroutine panic：安全包装（上报后重抛）
+q.Go(func() { watchTick() })
+
+// 3. 显式错误：异步队列
+q.Error("cache warmup failed", err)
+
+// 4. 错误日志：挂进任何已有 slog.Logger（Error 级起成为信号）
+logger := slog.New(q.Handler(slog.LevelWarn))
+
+// 5. 失败自检：周期探针，失败上报 high
+stop := q.Check("db-ping", 30*time.Second, ping)
+defer stop()
+
+// 不可恢复：同步上报 → flush → exit(1)
+if fatal { q.Fatal("config corrupt", err) }
+```
 
 ## 版本
 
-语义化版本；Nuwa 服务端与采集端 schema 兼容性见 Nuwa 仓库 docs/08。
+语义化版本。v0.1 函数式 API（`Capture`/`Report`/Sinks）保留兼容。
+当前：[![v0.2.0](https://img.shields.io/badge/module-v0.2.0-blue)](https://pkg.go.dev/github.com/lomehong/qingniao-go)
