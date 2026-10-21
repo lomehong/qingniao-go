@@ -15,8 +15,10 @@ import (
 // `normalize_text`）：两侧用同一个 golden 常量互钉，任何一侧改了算法都会
 // 让另一侧的测试失败——避免"同一 panic 因谁算指纹而落进两个 key"。
 //
-// 指纹 = sha256("go|错误类|帧1|帧2|帧3")，取前 32 个 hex 字符。
-func panicFingerprint(message, stack string) string {
+// 指纹 = sha256("repo|go|错误类|帧1|帧2|帧3")，取前 32 个 hex 字符。
+// repo 是身份的一部分（ADR-013）：两个仓库恰好同栈同名时不得合并——
+// 自愈流水线按仓库取 checkout、按仓库开 PR。
+func panicFingerprint(repo, message, stack string) string {
 	errorClass := ""
 	if strings.TrimSpace(message) != "" {
 		errorClass = normalizeText(message)
@@ -25,6 +27,8 @@ func panicFingerprint(message, stack string) string {
 	}
 	frames := parseGoFrames(stack)
 	sum := sha256.New()
+	sum.Write([]byte(repo))
+	sum.Write([]byte("|"))
 	sum.Write([]byte("go"))
 	sum.Write([]byte("|"))
 	sum.Write([]byte(errorClass))

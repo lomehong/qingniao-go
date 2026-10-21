@@ -100,7 +100,7 @@ func PanicEnvelope(meta Meta, recovered any, stack []byte, now time.Time) Envelo
 		// 客户端指纹与服务端算法一致（SPEC §4）。服务端当前按自己的算法
 		// 计算（信封超集原则，字段被忽略），两份值一致便于对账，也保证
 		// 服务端将来"优先采用客户端指纹"时无缝切换。
-		Fingerprint: panicFingerprint(headline, string(stack)),
+		Fingerprint: panicFingerprint(meta.Repo, headline, string(stack)),
 	}
 }
 

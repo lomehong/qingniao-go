@@ -278,7 +278,9 @@ func TestPanicEnvelopeFingerprintMatchesTheServerGolden(t *testing.T) {
 		"created by testing.(*T).Run in goroutine 1\n" +
 		"\tC:/Program Files/Go/src/testing/testing.go:1851 +0x3f6")
 	env := PanicEnvelope(Meta{Repo: "example.com/spike-target"}, "runtime error: index out of range [3] with length 3", stack, time.Now())
-	const golden = "20d8a3f3347cf11e192a405cd3434789"
+	// ADR-013：repo 纳入指纹首段后的新 golden，与 shanhaijing
+	// go_panic_fingerprint_matches_the_sdk_golden 互钉。
+	const golden = "5cc9dae18baa7dac8582fda50dedec8d"
 	if env.Fingerprint != golden {
 		t.Fatalf("panic fingerprint = %s, want %s", env.Fingerprint, golden)
 	}
@@ -294,8 +296,8 @@ func TestPanicFingerprintIsStableAcrossAddressAndLineDrift(t *testing.T) {
 	drifted := strings.ReplaceAll(base, "[3] with length 3", "[9] with length 9")
 	drifted = strings.ReplaceAll(drifted, "calc.go:17", "calc.go:21")
 	drifted = strings.ReplaceAll(drifted, "+0x8c", "+0x91")
-	a := panicFingerprint("runtime error: index out of range [3] with length 3", base)
-	b := panicFingerprint("runtime error: index out of range [9] with length 9", drifted)
+	a := panicFingerprint("example.com/spike-target", "runtime error: index out of range [3] with length 3", base)
+	b := panicFingerprint("example.com/spike-target", "runtime error: index out of range [9] with length 9", drifted)
 	if a != b {
 		t.Fatalf("volatile parts must not change the fingerprint: %s vs %s", a, b)
 	}
