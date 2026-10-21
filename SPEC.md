@@ -112,3 +112,29 @@ New(Option) → Reporter
 ```
 
 零配置：未显式给 Sink 时从 env 推导（`NUWA_INGEST_URL`/`NUWA_INGEST_TOKEN`）。
+
+## 10 · 实现补充（Rust 参考实现，向后兼容）
+
+`qingniao-rust`（2026-10-21）在实现 v1 时补了三处**语言无关**的契约。它们不改变既有信号语义，Go/Java 实现可逐步对齐：
+
+### 10.1 日志模板增加“绝对路径”折叠
+
+§4 的日志模板归一化增加一条：绝对路径（Unix `/…`、Windows `C:\…`）→ `⟦PATH⟧`。
+理由：同一故障在不同用户的 home 目录、不同机器的安装路径下必须落到同一个指纹；路径原文仍保留在信封的 `message`/`stack_trace` 里，供诊断。版本号继续折叠为 `⟦N⟧`，**精确版本放 `attributes`，不放指纹**——否则每次升级都会拆成新问题。
+
+### 10.2 日志钩子必须“锚定 EOF”，不得回扫历史
+
+日志 tail 类钩子首次读取必须从**文件末尾**开始（或持久化 offset）；轮转（文件变小）才从头读新文件；半行缓冲到换行。
+禁止把历史失败行重放成“新信号”——否则服务端的 occurrences/复发统计是假的（现场实例：启动回扫把历史安装失败重新立案，28 条台账里多数是幽灵案）。回填历史（如确需）必须携带**原始行时间戳**并标记为 backfill，不得使用当前时间。
+
+### 10.3 事件级归属与结构化上下文
+
+信封的 `attributes`（§8）与 `repo` 是**一等上下文**：一个应用级 Reporter 应当允许**每条事件**覆盖 `repo` 与附带 `attributes`，而不是为每个组件各起一个实例。
+- `repo` = 应龙签出/修复的目标仓库（例如信号点名的插件子仓）；
+- `attributes` 放复现所需的环境：运行时版本（如 dsh 版本）、组件版本、阶段、错误码（`ERR_*`）、安装模式等；
+- 指纹不包含版本；同一根因跨版本聚合，版本只用于复现与分诊。
+
+### 10.4 Rust panic 指纹互钉
+
+Rust 实现的 `panic_fingerprint` 镜像山海经 `parse_rust` 的当前行为（`repo|rust|error_class|<panic>@file>`），两仓用同一 golden 常量互钉：`53188b455b43cc5d1e02760404ae3c36`（trace 与断言见 `qingniao-rust/src/fingerprint.rs` 与 `crates/shanhaijing/src/fingerprint.rs`）。任一侧改 Rust 栈算法必须同时更新另一侧。
+
